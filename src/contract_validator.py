@@ -1,20 +1,36 @@
-"""Simple contract validator used as the starter baseline.
+"""Contract validator used as the lab baseline.
 
-The implementation intentionally covers only common deterministic checks.
-Students are expected to extend it with:
-- stronger type validation/coercion rules,
-- freshness checks,
-- cross-field/cross-table assertions,
-- severity-aware actions (block/quarantine/warn),
-- richer observability metadata.
+Deterministic checks: required/not-null, unique, accepted values, numeric
+range, declared type, and dataset-level freshness. Every issue also carries
+a severity-driven `action` (block / quarantine / warn) so callers can decide
+what to do with a failed batch without re-deriving policy from severity.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import yaml
+
+# critical -> stop the pipeline; warning -> ship data aside for review;
+# info -> let it through but surface the signal.
+SEVERITY_ACTION = {
+    "critical": "block",
+    "warning": "quarantine",
+    "info": "warn",
+}
+
+_TYPE_CHECKERS = {
+    "integer": lambda s: pd.to_numeric(s, errors="coerce"),
+    "number": lambda s: pd.to_numeric(s, errors="coerce"),
+    "datetime": lambda s: pd.to_datetime(s, errors="coerce", utc=True),
+}
+
+
+def action_for_severity(severity: str) -> str:
+    return SEVERITY_ACTION.get(severity, "warn")
 
 
 def _issue(
@@ -31,6 +47,7 @@ def _issue(
         "severity": severity,
         "passed": bool(passed),
         "details": details,
+        "action": action_for_severity(severity) if not passed else "none",
     }
 
 
@@ -100,9 +117,33 @@ def validate_dataframe(df: pd.DataFrame, contract: dict[str, Any]) -> list[dict[
                 )
             )
 
-        # Starter numeric range support. Type validation is intentionally minimal.
+        declared_type = rules.get("type")
+        coerced: pd.Series | None = None
+        if declared_type in _TYPE_CHECKERS:
+            coerced = _TYPE_CHECKERS[declared_type](series)
+            non_null = series.notna()
+            drift_mask = non_null & coerced.isna()
+            if declared_type == "integer":
+                # accept whole-number floats (e.g. "3.0"), reject real decimals
+                fractional_part = (coerced - coerced.round()).abs()
+                fractional_mask = coerced.notna() & (fractional_part > 1e-9)
+                drift_mask |= fractional_mask
+            drift_count = int(drift_mask.sum())
+            issues.append(
+                _issue(
+                    "type",
+                    column=column,
+                    severity=severity,
+                    passed=(drift_count == 0),
+                    details=f"declared_type={declared_type}; type_drift_count={drift_count}",
+                )
+            )
+
+        # Range check reuses the numeric coercion above when the column is
+        # already declared integer/number so a type-drift value cannot also
+        # silently pass range just because pd.to_numeric coerced it to NaN.
         if "min" in rules or "max" in rules:
-            numeric = pd.to_numeric(series, errors="coerce")
+            numeric = coerced if declared_type in ("integer", "number") else pd.to_numeric(series, errors="coerce")
             invalid = pd.Series(False, index=series.index)
             if "min" in rules:
                 invalid |= numeric < rules["min"]
@@ -119,9 +160,35 @@ def validate_dataframe(df: pd.DataFrame, contract: dict[str, Any]) -> list[dict[
                 )
             )
 
-    # TODO(student): validate contract-level freshness using contract['freshness'].
-    # TODO(student): validate declared data types. pd.to_numeric(..., errors='coerce')
-    #                can silently hide string/type drift if you do not check it explicitly.
+    freshness = contract.get("freshness")
+    if freshness:
+        fcol = freshness.get("column")
+        max_delay = freshness.get("max_delay_minutes")
+        fseverity = freshness.get("severity", "warning")
+        if fcol and fcol in df.columns and max_delay is not None:
+            ts = pd.to_datetime(df[fcol], errors="coerce", utc=True)
+            latest = ts.max()
+            if pd.isna(latest):
+                issues.append(
+                    _issue(
+                        "freshness",
+                        column=fcol,
+                        severity=fseverity,
+                        passed=False,
+                        details="no_valid_timestamp",
+                    )
+                )
+            else:
+                delay_minutes = (pd.Timestamp(datetime.now(timezone.utc)) - latest).total_seconds() / 60.0
+                issues.append(
+                    _issue(
+                        "freshness",
+                        column=fcol,
+                        severity=fseverity,
+                        passed=(delay_minutes <= max_delay),
+                        details=f"delay_minutes={delay_minutes:.1f}; max_delay_minutes={max_delay}",
+                    )
+                )
 
     return issues
 
