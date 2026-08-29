@@ -62,3 +62,28 @@ Khong can copy full conversation. Ghi cac decision quan trong.
   2. `zscore_detector`/`mad_detector`/`detect_distribution_shift` propagated NaN through `np.mean`/`np.median`/`np.std` when history contained a NaN entry (e.g. a missing day in a metrics history CSV), silently returning `score=nan, is_anomaly=False` — a real anomaly could hide behind one bad history point. Fixed by stripping NaN from `history`/`current_values`/`baseline_values` before computing statistics in all three functions.
 - Accept / reject / revise: Accept both fixes.
 - Why: both are exactly the class of "student's happy-path implementation didn't consider" bug a hidden hard-eval is designed to catch — a version/dtype-sensitive warning that could become a hard error on a newer pandas, and a silent false-negative on any metric history with a missing/null day.
+
+## Decision 8
+- Hypothesis: `detect_distribution()` only compared first moments (mean ratio + Welch mean-shift z), so any drift that preserves the mean is invisible — and "distribution drift tốt hơn mean ratio" is exactly what the lab guide asks for.
+- Prompt / request to agent: probe `detect_distribution` with shifts that keep the mean constant (variance blowup, bimodal split, shape change) plus a one-value current batch, and report false negatives.
+- Agent proposal / evidence: found four false negatives against the mean-only detector, all `is_anomaly=False`:
+  - baseline `N(100, 2)` vs current `N(100, 30)` (variance blowup) — score 1.006
+  - baseline `N(100, 5)` vs current `[50]*100 + [150]*100` (bimodal split) — score 1.007
+  - baseline `Uniform(0, 20)` vs current `Exponential(10)` (shape change) — score 1.027
+  - baseline `[10, 10, 11, 9, 10, 10]` vs current `[25]` (single-value batch) — score 2.500, both mean-based signals need >=2 points per side
+  Fix: added a two-sample Kolmogorov-Smirnov statistic comparing the full empirical CDFs, normalized by the alpha=0.01 critical value `1.6276 * sqrt((n+m)/(n*m))` so it stays sample-size aware, plus a MAD-based robust-z fallback for the single-observation case. All sub-scores rescaled onto one shared threshold (3.0) and reported individually in the result dict.
+- Evidence/test: all four cases now `is_anomaly=True` (scores 8.20 / 9.22 / 3.91 / 23.72). False-positive sweep on same-distribution samples: 3/400, 7/400, 3/400, 3/400, 7/400 at n = 10/30/100/500/2000 (~1%, consistent with the alpha=0.01 KS threshold). Power check: mean shift +10 detected 200/200, std 10->30 detected 196/200. New regression tests in `tests_public/test_distribution_shape.py`; existing `test_extreme_mean_shift_detected` still green.
+- Accept / reject / revise: Accept.
+- Why: KS is non-parametric and compares whole distributions, so it catches variance/shape/multimodality drift that no mean statistic can see, while the sample-size-aware critical value keeps the false-positive rate flat from a 10-point batch to a 2000-point batch. The mean-ratio and Welch signals were kept because they still react faster to pure level shifts.
+
+## Decision 9
+- Hypothesis: `evaluate_multiwindow_burn()` paged at burn rate >=1x on both windows, which contradicts the lab requirement "transient spike ngắn -> không page" — a 1x burn is by definition the rate the error budget is *meant* to be spent at.
+- Prompt / request to agent: check the policy against Google SRE workbook table 5-3 and find inputs where it pages when it should not.
+- Agent proposal / evidence: two wrong pages found:
+  - `multiwindow_burn(short=20, long=1.5)` -> `page=True, severity="warning"`. A short spike over a barely-elevated long window is the textbook transient the policy exists to suppress; the `short > long` transient branch was unreachable whenever `long >= 1`.
+  - `multiwindow_burn(short=2, long=10)` -> `page=True`. The long window is still hot but the burn already stopped, so the short window should let the alert reset instead of firing.
+  Fix: only the two fast-burn rows of table 5-3 page (>=14.4x -> critical, >=6x -> high). The >=1x row becomes a ticket: `page=False, severity="warning", action="ticket"`. Added an explicit `action` key (page/ticket/none) alongside the existing severity.
+  Also fixed float noise in `calculate_slo`: `1.0 - 0.995` is `0.005000000000000004` in binary float, which made `allowed_bad_rate` inexact and `burn_rate` `3.9999999999999964` instead of `4.0`. Rounding the budget to 12 decimals makes the budget, burn rate and the at-budget boundary comparison exact.
+- Evidence/test: `short=20, long=1.5` and `short=2, long=10` now both `page=False`; `short=20, long=18` still critical, `short=8, long=7` high, `short=20, long=0.2` no page. `slo_status(0.995, 2, 100)` now returns `allowed_bad_rate=0.005`, `burn_rate=4.0` exactly; `slo_status(0.99, 1, 100)` returns `burn_rate=1.0`, `remaining_error_budget_fraction=0.0`, `breached=False`. New regression tests in `tests_public/test_slo_burn_policy.py`; both existing public SLO tests still green.
+- Accept / reject / revise: Accept.
+- Why: the whole point of a multi-window multi-burn-rate policy is that alert urgency tracks how fast the budget is being consumed. Paging on a 1x burn means paging on normal operation, which is precisely the alert-fatigue failure the SRE workbook designs against — and an exact `burn_rate` matters because every threshold in the policy is a comparison against it.
